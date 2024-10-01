@@ -6,6 +6,7 @@ pub mod live_builder;
 pub mod mev_boost;
 pub mod primitives;
 pub mod roothash;
+pub mod rpc_state_provider;
 pub mod telemetry;
 pub mod utils;
 pub mod validation_api_client;
