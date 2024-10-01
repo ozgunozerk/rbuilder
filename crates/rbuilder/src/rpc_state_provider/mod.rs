@@ -1,13 +1,13 @@
+/// Instead of having the full `State`,
+/// we fetch the necessary information from the `Reth RPC`,
+///
+/// implements `Database` trait required by `EvmBuilder::with_db`
 use std::str::FromStr;
 
 use alloy_primitives::{
     hex, keccak256, Address as AlloyAddress, Bytes as AlloyBytes, B256 as AlloyB256,
     U256 as AlloyU256,
 };
-/// Instead of having the full `State`,
-/// we fetch the necessary information from the `Reth RPC`,
-///
-/// implements `Database` trait required by `EvmBuilder::with_db`
 use ethers::prelude::*; // for making RPC calls
 use ethers::types::{Address as EthersAddress, H256 as EthersH256, U256 as EthersU256}; // Ether's types
 use futures::executor::block_on;
