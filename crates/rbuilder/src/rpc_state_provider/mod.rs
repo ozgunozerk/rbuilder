@@ -11,14 +11,15 @@ use alloy_primitives::{
 use ethers::prelude::*; // for making RPC calls
 use ethers::types::{Address as EthersAddress, H256 as EthersH256, U256 as EthersU256}; // Ether's types
 use futures::executor::block_on;
+use revm::primitives::KECCAK_EMPTY;
 use revm_primitives::{AccountInfo, Bytecode};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RPCError {
-    #[error("RPC call failed: {0}")]
-    RpcCallError(String),
-    #[error("RPC construction failedd: {0}")]
+    #[error("RPC call failed: {0} at method {1}")]
+    RpcCallError(String, String),
+    #[error("RPC construction failed: {0}")]
     RpcConstructionError(String),
     #[error("code_by_hash method makes no sense in RPC state provider")]
     UnsupportedOperation,
@@ -50,7 +51,7 @@ where
             .get_balance(Self::from_alloy_to_ethers_address(address), None)
             .await
             .map(|balance| AlloyU256::from(balance.as_u64()))
-            .map_err(|e| RPCError::RpcCallError(e.to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_balance".to_string()))
     }
 
     // Helper function to fetch nonce
@@ -59,7 +60,7 @@ where
             .get_transaction_count(Self::from_alloy_to_ethers_address(address), None)
             .await
             .map(|nonce| nonce.as_u64())
-            .map_err(|e| RPCError::RpcCallError(e.to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_nonce".to_string()))
     }
 
     // Helper function to fetch code
@@ -71,7 +72,7 @@ where
                 let bytes_vec: Vec<u8> = bytes.to_vec();
                 AlloyBytes::from(bytes_vec)
             })
-            .map_err(|e| RPCError::RpcCallError(e.to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_code".to_string()))
     }
 
     // Helper function to fetch storage
@@ -89,7 +90,7 @@ where
                 let storage = Self::from_ether_to_alloy_h256(h256);
                 Self::from_alloy_b256_to_alloy_u256(storage)
             })
-            .map_err(|e| RPCError::RpcCallError(e.to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_storage".to_string()))
     }
 
     // Helper function to fetch block hash
@@ -97,7 +98,7 @@ where
         self.provider
             .get_block(block_number as u64)
             .await
-            .map_err(|e| RPCError::RpcCallError(e.to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_block_hash".to_string()))
             .map(|block| {
                 let block_hash = block.unwrap().hash.unwrap();
                 Self::from_ether_to_alloy_h256(block_hash)
@@ -140,6 +141,7 @@ where
         // Fetch balance, nonce, and code in a blocking manner
         let balance = block_on(self.get_balance(address))?;
         let nonce = block_on(self.get_nonce(address))?;
+
         let (code, code_hash) = match block_on(self.get_code(address)) {
             Ok(code) => {
                 let code_hash = hex::encode(keccak256(&code));
@@ -147,7 +149,7 @@ where
 
                 (Some(Bytecode::new_raw(code)), code_hash)
             } // TODO: hash the code
-            Err(_) => (None, AlloyB256::default()),
+            Err(_) => (None, KECCAK_EMPTY),
         };
 
         let account_info = AccountInfo {
@@ -183,8 +185,8 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::hex::decode;
-    use ethers::{providers::Provider, types::H256 as EthersH256};
-    use std::str::FromStr;
+    use ethers::providers::Provider;
+    use revm::Database;
 
     #[tokio::test]
     async fn mock_rpc_get_balance() {
@@ -262,5 +264,51 @@ mod tests {
             fetched_block_hash,
             RPCDatabase::<MockProvider>::from_ether_to_alloy_h256(block_hash)
         );
+    }
+
+    #[test]
+    fn integration_test_rpc_database() {
+        // Setup: Create a mocked provider and an RPCDatabase instance
+        let (provider, mock) = Provider::<MockProvider>::mocked();
+        let mut rpc_db = RPCDatabase { provider };
+
+        // // Define test parameters
+        let test_address =
+            AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let block_number = 12345;
+        let block_hash = EthersH256::from_low_u64_be(0xabcdef);
+        let test_balance = AlloyU256::from(1000);
+        let test_nonce = 42;
+        let code_hex = "6001600101"; // Example bytecode in hex
+        let code_bytes = decode(code_hex).expect("Invalid hex string"); // Convert hex string to Vec<u8>
+        let test_code = Bytes::from(code_bytes.clone());
+
+        // Create a mock Block object for block hash
+        let test_block: Block<EthersH256> = Block {
+            hash: Some(block_hash),
+            number: Some(block_number.into()),
+            ..Default::default()
+        };
+        mock.push(test_block).unwrap();
+
+        mock.push::<Bytes, _>(test_code).unwrap();
+        mock.push(U256::from(test_nonce)).unwrap();
+        mock.push(test_balance).unwrap();
+
+        // Act: Call the methods from the Database trait
+        let fetched_account_info = rpc_db.basic(test_address).unwrap().unwrap();
+        let fetched_balance = fetched_account_info.balance;
+        let fetched_nonce = fetched_account_info.nonce;
+
+        let fetched_block_hash = rpc_db.block_hash(block_number).unwrap();
+
+        // Assert: Verify the results
+        assert_eq!(fetched_account_info.nonce, test_nonce as u64);
+        assert_eq!(fetched_balance, test_balance);
+        assert_eq!(
+            fetched_block_hash,
+            RPCDatabase::<MockProvider>::from_ether_to_alloy_h256(block_hash)
+        );
+        assert_eq!(fetched_nonce, test_nonce);
     }
 }
