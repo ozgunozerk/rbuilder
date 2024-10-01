@@ -24,15 +24,24 @@ pub enum RPCError {
     UnsupportedOperation,
 }
 
-pub struct RPCDatabase {
-    provider: Provider<Http>, // Ethers provider for RPC calls
+pub struct RPCDatabase<P> {
+    provider: Provider<P>, // Ethers provider for RPC calls
 }
 
-impl RPCDatabase {
+impl RPCDatabase<Http> {
     pub fn new(provider_url: &str) -> Result<Self, RPCError> {
         let provider = Provider::<Http>::try_from(provider_url)
             .map_err(|e| RPCError::RpcConstructionError(e.to_string()))?;
         Ok(Self { provider })
+    }
+}
+
+impl<P> RPCDatabase<P>
+where
+    P: JsonRpcClient,
+{
+    pub fn from_provider(provider: Provider<P>) -> Self {
+        Self { provider }
     }
 
     // Helper function to fetch balance
@@ -86,7 +95,7 @@ impl RPCDatabase {
     // Helper function to fetch block hash
     async fn get_block_hash(&self, block_number: u64) -> Result<AlloyB256, RPCError> {
         self.provider
-            .get_block(block_number)
+            .get_block(block_number as u64)
             .await
             .map_err(|e| RPCError::RpcCallError(e.to_string()))
             .map(|block| {
@@ -121,7 +130,10 @@ impl RPCDatabase {
 }
 
 // Blocking implementation of Database trait for revm
-impl revm::Database for RPCDatabase {
+impl<P> revm::Database for RPCDatabase<P>
+where
+    P: JsonRpcClient,
+{
     type Error = RPCError;
 
     fn basic(&mut self, address: AlloyAddress) -> Result<Option<AccountInfo>, Self::Error> {
@@ -164,5 +176,91 @@ impl revm::Database for RPCDatabase {
     fn block_hash(&mut self, number: u64) -> Result<AlloyB256, Self::Error> {
         // Fetch the block hash for a given block number
         block_on(self.get_block_hash(number))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::hex::decode;
+    use ethers::{providers::Provider, types::H256 as EthersH256};
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn mock_rpc_get_balance() {
+        let (provider, mock) = Provider::mocked();
+        let rpc_db = RPCDatabase { provider };
+        let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
+
+        mock.push(U256::from(1000u64)).unwrap();
+
+        let balance = rpc_db.get_balance(address).await.unwrap();
+        assert_eq!(balance, AlloyU256::from(1000u64));
+    }
+
+    #[tokio::test]
+    async fn mock_rpc_get_nonce() {
+        let (provider, mock) = Provider::mocked();
+        let rpc_db = RPCDatabase { provider };
+        let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
+
+        mock.push(U256::from(5u64)).unwrap();
+
+        let nonce = rpc_db.get_nonce(address).await.unwrap();
+        assert_eq!(nonce, 5);
+    }
+
+    #[tokio::test]
+    async fn mock_rpc_get_code() {
+        let (provider, mock) = Provider::mocked();
+        let rpc_db = RPCDatabase { provider };
+        let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let code_hex = "6001600101"; // Example bytecode in hex
+        let code_bytes = decode(code_hex).expect("Invalid hex string"); // Convert hex string to Vec<u8>
+        let code = Bytes::from(code_bytes.clone());
+
+        // Push the serialized bytes to the mock
+        mock.push::<Bytes, _>(code).unwrap();
+
+        let fetched_code = rpc_db.get_code(address).await.unwrap();
+        assert_eq!(fetched_code, AlloyBytes::from(code_bytes.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn mock_rpc_get_storage() {
+        let (provider, mock) = Provider::mocked();
+        let rpc_db = RPCDatabase { provider };
+        let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
+        let storage_index = AlloyU256::from(1u64);
+        let storage_value = EthersH256::from_low_u64_be(42);
+
+        mock.push(storage_value).unwrap();
+
+        let fetched_storage = rpc_db.get_storage(address, storage_index).await.unwrap();
+        assert_eq!(fetched_storage, AlloyU256::from(42u64));
+    }
+
+    #[tokio::test]
+    async fn mock_rpc_get_block_hash() {
+        let (provider, mock) = Provider::mocked();
+        let rpc_db = RPCDatabase { provider };
+        let block_number = 12345;
+        let block_hash = EthersH256::from_low_u64_be(0xabcdef);
+
+        // Create a mock Block object
+        let block: Block<EthersH256> = Block {
+            hash: Some(block_hash), // This should be of type EthersH256 or whatever your Block struct expects
+            number: Some(block_number.into()), // Add any other required fields for your Block
+            ..Default::default()    // Ensure other required fields are filled out as needed
+        };
+
+        // Push the mock Block into the provider
+        mock.push(block).unwrap();
+
+        let fetched_block_hash = rpc_db.get_block_hash(block_number).await.unwrap();
+        assert_eq!(
+            fetched_block_hash,
+            RPCDatabase::<MockProvider>::from_ether_to_alloy_h256(block_hash)
+        );
     }
 }
