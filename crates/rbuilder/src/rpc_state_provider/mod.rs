@@ -8,8 +8,11 @@ use alloy_primitives::{
     hex, keccak256, Address as AlloyAddress, Bytes as AlloyBytes, B256 as AlloyB256,
     U256 as AlloyU256,
 };
-use ethers::prelude::*; // for making RPC calls
 use ethers::types::{Address as EthersAddress, H256 as EthersH256, U256 as EthersU256}; // Ether's types
+use ethers::{
+    middleware::Middleware,
+    providers::{Http, JsonRpcClient, Provider},
+};
 use futures::executor::block_on;
 use revm::primitives::KECCAK_EMPTY;
 use revm_primitives::{AccountInfo, Bytecode};
@@ -185,7 +188,10 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::hex::decode;
-    use ethers::providers::Provider;
+    use ethers::{
+        providers::MockProvider,
+        types::{Block, Bytes},
+    };
     use revm::Database;
 
     #[tokio::test]
@@ -194,7 +200,7 @@ mod tests {
         let rpc_db = RPCDatabase { provider };
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
 
-        mock.push(U256::from(1000u64)).unwrap();
+        mock.push(EthersU256::from(1000u64)).unwrap();
 
         let balance = rpc_db.get_balance(address).await.unwrap();
         assert_eq!(balance, AlloyU256::from(1000u64));
@@ -206,7 +212,7 @@ mod tests {
         let rpc_db = RPCDatabase { provider };
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
 
-        mock.push(U256::from(5u64)).unwrap();
+        mock.push(EthersU256::from(5u64)).unwrap();
 
         let nonce = rpc_db.get_nonce(address).await.unwrap();
         assert_eq!(nonce, 5);
@@ -292,7 +298,7 @@ mod tests {
         mock.push(test_block).unwrap();
 
         mock.push::<Bytes, _>(test_code).unwrap();
-        mock.push(U256::from(test_nonce)).unwrap();
+        mock.push(EthersU256::from(test_nonce)).unwrap();
         mock.push(test_balance).unwrap();
 
         // Act: Call the methods from the Database trait
