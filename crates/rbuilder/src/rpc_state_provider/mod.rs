@@ -4,6 +4,7 @@
 /// implements `Database` trait required by `EvmBuilder::with_db`
 use std::str::FromStr;
 
+use ahash::HashMap;
 use alloy_primitives::{
     hex, keccak256, Address as AlloyAddress, Bytes as AlloyBytes, B256 as AlloyB256,
     U256 as AlloyU256,
@@ -24,19 +25,34 @@ pub enum RPCError {
     RpcCallError(String, String),
     #[error("RPC construction failed: {0}")]
     RpcConstructionError(String),
-    #[error("code_by_hash method makes no sense in RPC state provider")]
-    UnsupportedOperation,
+    #[error("Code could not found for hash: {0}")]
+    CodeNotFound(String),
 }
 
+#[derive(Debug)]
 pub struct RPCDatabase<P> {
     provider: Provider<P>, // Ethers provider for RPC calls
+    cache: RpcCache,
+}
+
+#[derive(Debug, Default)]
+pub struct RpcCache {
+    block_hashes: HashMap<u64, AlloyB256>,
+    balances: HashMap<AlloyAddress, AlloyU256>,
+    nonces: HashMap<AlloyAddress, u64>,
+    codes: HashMap<AlloyAddress, AlloyBytes>,
+    code_hashes: HashMap<AlloyB256, AlloyBytes>,
+    storages: HashMap<AlloyAddress, AlloyU256>,
 }
 
 impl RPCDatabase<Http> {
     pub fn new(provider_url: &str) -> Result<Self, RPCError> {
         let provider = Provider::<Http>::try_from(provider_url)
             .map_err(|e| RPCError::RpcConstructionError(e.to_string()))?;
-        Ok(Self { provider })
+
+        let cache = RpcCache::default();
+
+        Ok(Self { provider, cache })
     }
 }
 
@@ -45,67 +61,123 @@ where
     P: JsonRpcClient,
 {
     pub fn from_provider(provider: Provider<P>) -> Self {
-        Self { provider }
+        let cache = RpcCache::default();
+
+        Self { provider, cache }
     }
 
-    // Helper function to fetch balance
-    async fn get_balance(&self, address: AlloyAddress) -> Result<AlloyU256, RPCError> {
-        self.provider
+    async fn get_balance(&mut self, address: AlloyAddress) -> Result<AlloyU256, RPCError> {
+        let cached_balance = self.cache.balances.get(&address);
+        if let Some(&balance) = cached_balance {
+            return Ok(balance);
+        }
+
+        let balance = self
+            .provider
             .get_balance(Self::from_alloy_to_ethers_address(address), None)
             .await
             .map(|balance| AlloyU256::from(balance.as_u64()))
-            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_balance".to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_balance".to_string()))?;
+
+        // Update the cache
+        self.cache.balances.insert(address, balance);
+
+        Ok(balance)
     }
 
-    // Helper function to fetch nonce
-    async fn get_nonce(&self, address: AlloyAddress) -> Result<u64, RPCError> {
-        self.provider
+    async fn get_nonce(&mut self, address: AlloyAddress) -> Result<u64, RPCError> {
+        let cached_nonce = self.cache.nonces.get(&address);
+        if let Some(&nonce) = cached_nonce {
+            return Ok(nonce);
+        }
+
+        let nonce = self
+            .provider
             .get_transaction_count(Self::from_alloy_to_ethers_address(address), None)
             .await
             .map(|nonce| nonce.as_u64())
-            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_nonce".to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_nonce".to_string()))?;
+
+        self.cache.nonces.insert(address, nonce);
+
+        Ok(nonce)
     }
 
-    // Helper function to fetch code
-    async fn get_code(&self, address: AlloyAddress) -> Result<AlloyBytes, RPCError> {
-        self.provider
+    async fn get_code(&mut self, address: AlloyAddress) -> Result<AlloyBytes, RPCError> {
+        let cached_code = self.cache.codes.get(&address);
+        if let Some(code) = cached_code {
+            return Ok(code.clone());
+        }
+
+        let code = self
+            .provider
             .get_code(Self::from_alloy_to_ethers_address(address), None)
             .await
             .map(|bytes| {
                 let bytes_vec: Vec<u8> = bytes.to_vec();
                 AlloyBytes::from(bytes_vec)
             })
-            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_code".to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_code".to_string()))?;
+
+        self.cache.codes.insert(address, code.clone());
+
+        // Also update the code_hashes cache
+        let code_hash = hex::encode(keccak256(&code));
+        let code_hash = AlloyB256::from_str(&code_hash).unwrap();
+        self.cache.code_hashes.insert(code_hash, code.clone());
+
+        Ok(code)
     }
 
     // Helper function to fetch storage
     async fn get_storage(
-        &self,
+        &mut self,
         address: AlloyAddress,
         index: AlloyU256,
     ) -> Result<AlloyU256, RPCError> {
         let index_u256 = Self::from_alloy_to_ethers_u256(index);
         let index = Self::from_ethers_u256_to_ethers_h256(index_u256);
-        self.provider
+
+        let cached_storage = self.cache.storages.get(&address);
+        if let Some(&storage) = cached_storage {
+            return Ok(storage);
+        }
+
+        let storage = self
+            .provider
             .get_storage_at(Self::from_alloy_to_ethers_address(address), index, None)
             .await
             .map(|h256| {
                 let storage = Self::from_ether_to_alloy_h256(h256);
                 Self::from_alloy_b256_to_alloy_u256(storage)
             })
-            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_storage".to_string()))
+            .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_storage".to_string()))?;
+
+        self.cache.storages.insert(address, storage);
+
+        Ok(storage)
     }
 
     // Helper function to fetch block hash
-    async fn get_block_hash(&self, block_number: u64) -> Result<AlloyB256, RPCError> {
-        self.provider
+    async fn get_block_hash(&mut self, block_number: u64) -> Result<AlloyB256, RPCError> {
+        let cached_block_hash = self.cache.block_hashes.get(&block_number);
+        if let Some(&block_hash) = cached_block_hash {
+            return Ok(block_hash);
+        }
+
+        let block_hash = self
+            .provider
             .get_block(block_number as u64)
             .await
             .map_err(|e| RPCError::RpcCallError(e.to_string(), "get_block_hash".to_string()))
             .map(|block| {
                 let block_hash = block.unwrap().hash.unwrap();
                 Self::from_ether_to_alloy_h256(block_hash)
-            })
+            })?;
+
+        self.cache.block_hashes.insert(block_number, block_hash);
+
+        Ok(block_hash)
     }
 
     fn from_alloy_to_ethers_address(address: AlloyAddress) -> EthersAddress {
@@ -164,9 +236,13 @@ where
         Ok(Some(account_info))
     }
 
-    fn code_by_hash(&mut self, _code_hash: AlloyB256) -> Result<Bytecode, Self::Error> {
-        // Use the code hash to fetch the code from the blockchain
-        Err(RPCError::UnsupportedOperation)
+    fn code_by_hash(&mut self, code_hash: AlloyB256) -> Result<Bytecode, Self::Error> {
+        self.cache
+            .code_hashes
+            .get(&code_hash)
+            .cloned()
+            .map(|bytes| Bytecode::LegacyRaw(bytes.into()))
+            .ok_or(RPCError::CodeNotFound(code_hash.to_string()))
     }
 
     fn storage(
@@ -197,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn mock_rpc_get_balance() {
         let (provider, mock) = Provider::mocked();
-        let rpc_db = RPCDatabase { provider };
+        let mut rpc_db = RPCDatabase::from_provider(provider);
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
 
         mock.push(EthersU256::from(1000u64)).unwrap();
@@ -209,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn mock_rpc_get_nonce() {
         let (provider, mock) = Provider::mocked();
-        let rpc_db = RPCDatabase { provider };
+        let mut rpc_db = RPCDatabase::from_provider(provider);
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
 
         mock.push(EthersU256::from(5u64)).unwrap();
@@ -221,7 +297,7 @@ mod tests {
     #[tokio::test]
     async fn mock_rpc_get_code() {
         let (provider, mock) = Provider::mocked();
-        let rpc_db = RPCDatabase { provider };
+        let mut rpc_db = RPCDatabase::from_provider(provider);
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
         let code_hex = "6001600101"; // Example bytecode in hex
         let code_bytes = decode(code_hex).expect("Invalid hex string"); // Convert hex string to Vec<u8>
@@ -237,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn mock_rpc_get_storage() {
         let (provider, mock) = Provider::mocked();
-        let rpc_db = RPCDatabase { provider };
+        let mut rpc_db = RPCDatabase::from_provider(provider);
         let address = AlloyAddress::from_str("0x1234567890123456789012345678901234567890").unwrap();
         let storage_index = AlloyU256::from(1u64);
         let storage_value = EthersH256::from_low_u64_be(42);
@@ -251,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn mock_rpc_get_block_hash() {
         let (provider, mock) = Provider::mocked();
-        let rpc_db = RPCDatabase { provider };
+        let mut rpc_db = RPCDatabase::from_provider(provider);
         let block_number = 12345;
         let block_hash = EthersH256::from_low_u64_be(0xabcdef);
 
@@ -275,8 +351,8 @@ mod tests {
     #[test]
     fn integration_test_rpc_database() {
         // Setup: Create a mocked provider and an RPCDatabase instance
-        let (provider, mock) = Provider::<MockProvider>::mocked();
-        let mut rpc_db = RPCDatabase { provider };
+        let (provider, mock) = Provider::mocked();
+        let mut rpc_db = RPCDatabase::from_provider(provider);
 
         // // Define test parameters
         let test_address =
